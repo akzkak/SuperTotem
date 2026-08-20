@@ -20,6 +20,7 @@ local settings = {
     STRICT_MODE = true,
     AUTO_IMBUE_MODE = false,
     IMBUE_TYPE = "Rockbiter Weapon",
+    BAR_SCALE = 1,
     EARTH_TOTEM = "Strength of Earth Totem",
     FIRE_TOTEM = "Flametongue Totem",
     AIR_TOTEM = "Windfury Totem",
@@ -65,6 +66,25 @@ for name, id in pairs(SPELL_ID_LOOKUP) do
 end
 
 local superwowEnabled = SUPERWOW_VERSION and true or false
+local nampowerEnabled = false
+local nampowerVersion = nil
+
+-- Nampower exposes GetNampowerVersion() when its client DLL is loaded. Its
+-- instant-spell queue lets one /stbuff invocation submit every eligible totem
+-- instead of requiring one hardware click per global cooldown.
+local function DetectNampower()
+    nampowerEnabled = false
+    nampowerVersion = nil
+
+    if not GetNampowerVersion then return false end
+
+    local major, minor, patch = GetNampowerVersion()
+    if not major then return false end
+
+    nampowerEnabled = true
+    nampowerVersion = tostring(major).."."..tostring(minor or 0).."."..tostring(patch or 0)
+    return true
+end
 local totemUnitIds = {}
 local totemPositions = { air=nil, fire=nil, earth=nil, water=nil }
 local RANGE_CHECK_INTERVAL = 2.0
@@ -266,7 +286,6 @@ local SHIELD_DEFINITIONS = {
 
 local lastTotemRecallTime = 0;
 local lastAllTotemsActiveTime = 0;
-local lastActiveMessageTime = 0;
 local lastTotemCastTime = 0;
 local lastFireNovaCastTime = 0;
 local FIRE_NOVA_DURATION = 5;
@@ -568,7 +587,7 @@ local function CheckTotemRange()
         end
     end
     if outOfRange then
-        DEFAULT_CHAT_FRAME:AddMessage("Totems: OUT OF RANGE - redropping", 1, 0.5, 0)
+        PrintMessage("Totems out of range - redropping.")
     end
     return outOfRange
 end
@@ -667,16 +686,27 @@ local function DropTotems()
     local currentTime = GetTime();
     if superwowEnabled and CheckTotemRange() then lastAllTotemsActiveTime = 0 end
     if CheckAndRefreshShield() then return end
-    CheckAndRefreshImbue();
+    -- In Nampower mode the imbue may itself trigger the GCD, so defer it until
+    -- after the totem readiness snapshot below.
+    if not nampowerEnabled then CheckAndRefreshImbue() end
     if currentTime - lastTotemCastTime < TOTEM_CAST_DELAY then return end
 
+    -- Cache cooldown state for the duration of this /stbuff. This matters in
+    -- Nampower mode: after the first queued cast, the client reports the GCD on
+    -- the remaining spells even though they were ready when the click began.
+    local cooldownBySpell = {};
     local function IsOnCooldown(spellName)
         if not spellName then return false end
+        if cooldownBySpell[spellName] ~= nil then return cooldownBySpell[spellName] end
         local idx = spellNameToIndex[spellName];
-        if not idx then return false end
+        if not idx then
+            cooldownBySpell[spellName] = false;
+            return false;
+        end
         local start, duration = GetSpellCooldown(idx, BOOKTYPE_SPELL);
-        if not start or not duration then return false end
-        return duration > 0 and (start + duration) > currentTime;
+        local onCooldown = start and duration and duration > 0 and (start + duration) > currentTime;
+        cooldownBySpell[spellName] = onCooldown and true or false;
+        return cooldownBySpell[spellName];
     end
 
     -- Record that we just cast a totem spell so UNIT_MODEL_CHANGED can match it
@@ -690,6 +720,21 @@ local function DropTotems()
         if element == "fire"  then return settings.FIRE_TOTEM_FB  end
         if element == "earth" then return settings.EARTH_TOTEM_FB end
         return nil;
+    end
+
+    -- Take the readiness snapshot before Nampower submits any casts. Preserve
+    -- the addon's existing cooldown/fallback decisions for every element.
+    if nampowerEnabled then
+        IsOnCooldown(settings.AIR_TOTEM);
+        IsOnCooldown(settings.FIRE_TOTEM);
+        IsOnCooldown(settings.EARTH_TOTEM);
+        IsOnCooldown(settings.WATER_TOTEM);
+        IsOnCooldown(settings.AIR_TOTEM_FB);
+        IsOnCooldown(settings.FIRE_TOTEM_FB);
+        IsOnCooldown(settings.EARTH_TOTEM_FB);
+        if settings.STRATHOLME_MODE then IsOnCooldown("Disease Cleansing Totem") end
+        if settings.ZG_MODE then IsOnCooldown("Poison Cleansing Totem") end
+        CheckAndRefreshImbue();
     end
 
     for i, totem in ipairs(totemState) do
@@ -824,7 +869,8 @@ local function DropTotems()
             PrintMessage("Casting "..totem.spell.." (forced recast for cleanse pulse).");
             totemState[i].locallyVerified = true; totemState[i].localVerifyTime = currentTime;
             totemState[i].unitId = nil; totemPositions.water = nil;
-            lastTotemCastTime = currentTime; return;
+            lastTotemCastTime = currentTime;
+            if not nampowerEnabled then return end
         elseif not totem.locallyVerified then
             if not totem.spell or totem.spell == "" then
                 totemState[i].locallyVerified = true; totemState[i].serverVerified = true;
@@ -844,7 +890,8 @@ local function DropTotems()
                     totemState[i].buff  = TOTEM_DEFINITIONS[fb] and TOTEM_DEFINITIONS[fb].buff;
                     totemState[i].locallyVerified = true; totemState[i].localVerifyTime = currentTime;
                     totemState[i].unitId = nil; totemPositions[totem.element] = nil;
-                    lastTotemCastTime = currentTime; return;
+                    lastTotemCastTime = currentTime;
+                    if not nampowerEnabled then return end
                 else
                     -- No fallback or fallback also on cooldown: leave unverified, continue to next slot
                     PrintMessage("Skipping "..totem.spell.." (on cooldown, no fallback ready)");
@@ -859,7 +906,8 @@ local function DropTotems()
                 PrintMessage("Casting "..totem.spell..".");
                 totemState[i].locallyVerified = true; totemState[i].localVerifyTime = currentTime;
                 totemState[i].unitId = nil; totemPositions[totem.element] = nil;
-                lastTotemCastTime = currentTime; return;
+                lastTotemCastTime = currentTime;
+                if not nampowerEnabled then return end
             end
         end
     end
@@ -951,10 +999,6 @@ local function DropTotems()
         PrintMessage("All totems are active.");
         if lastAllTotemsActiveTime == 0 then
             lastAllTotemsActiveTime = currentTime;
-            if currentTime - lastActiveMessageTime >= 1.0 then
-                lastActiveMessageTime = currentTime;
-                DEFAULT_CHAT_FRAME:AddMessage("Totems: ACTIVE", 1, 0, 0);
-            end
         end
     else
         lastAllTotemsActiveTime = 0;
@@ -1551,6 +1595,9 @@ local function OnEvent()
         settings.STRICT_MODE         = db.STRICT_MODE ~= false;
         settings.AUTO_IMBUE_MODE     = db.AUTO_IMBUE_MODE     or false;
         settings.IMBUE_TYPE          = db.IMBUE_TYPE          or "Rockbiter Weapon";
+        settings.BAR_SCALE           = tonumber(db.BAR_SCALE) or 1;
+        if settings.BAR_SCALE < 0.5 then settings.BAR_SCALE = 0.5 end
+        if settings.BAR_SCALE > 2.0 then settings.BAR_SCALE = 2.0 end
         local function loadTotem(val, default)
             if val == "none" then return nil end
             return val or default;
@@ -1580,6 +1627,7 @@ local function OnEvent()
         db.STRICT_MODE         = settings.STRICT_MODE;
         db.AUTO_IMBUE_MODE     = settings.AUTO_IMBUE_MODE;
         db.IMBUE_TYPE          = settings.IMBUE_TYPE;
+        db.BAR_SCALE           = settings.BAR_SCALE;
         db.EARTH_TOTEM         = settings.EARTH_TOTEM or db.EARTH_TOTEM or "none";
         db.FIRE_TOTEM          = settings.FIRE_TOTEM  or db.FIRE_TOTEM  or "none";
         db.AIR_TOTEM           = settings.AIR_TOTEM   or db.AIR_TOTEM   or "none";
@@ -1619,6 +1667,7 @@ local function OnEvent()
         if ST_RangeSlider_Refresh     then ST_RangeSlider_Refresh()     end
         if ST_TotemBar_RefreshFallbackBadges then ST_TotemBar_RefreshFallbackBadges() end
         if ST_ImbueBar_Refresh        then ST_ImbueBar_Refresh()        end
+        if ST_TotemBar_RefreshScale   then ST_TotemBar_RefreshScale()   end
 
         if SUPERWOW_VERSION then
             superwowEnabled=true
@@ -1628,10 +1677,19 @@ local function OnEvent()
             DEFAULT_CHAT_FRAME:AddMessage("SuperTotem: SuperWoW not detected - using fallback buff detection.");
         end
         DEFAULT_CHAT_FRAME:AddMessage("SuperTotem: Loaded.");
+    elseif event=="PLAYER_LOGIN" then
+        -- Match Nampower-aware addons by detecting after the client and addons
+        -- have finished loading, when GetNampowerVersion is guaranteed visible.
+        if DetectNampower() then
+            DEFAULT_CHAT_FRAME:AddMessage("SuperTotem: Nampower v"..nampowerVersion.." detected - multi-totem /stbuff enabled.");
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("SuperTotem: Nampower not detected - /stbuff casts one eligible totem per click.");
+        end
     end
 end
 local f=CreateFrame("Frame");
 f:RegisterEvent("VARIABLES_LOADED");
+f:RegisterEvent("PLAYER_LOGIN");
 f:SetScript("OnEvent",OnEvent);
 PrintUsage();
 
@@ -1743,10 +1801,30 @@ do
         end
     end
 
-    local tt = CreateFrame("GameTooltip","BP_MenuTT",UIParent,"GameTooltipTemplate");
-    tt:SetOwner(UIParent,"ANCHOR_NONE");
+    -- pfUI skins and positions the shared GameTooltip, not arbitrary tooltip
+    -- frames created by third-party addons. OptionalDeps makes pfUI load first
+    -- when enabled, while the private tooltip remains the standalone fallback.
+    local pfUITooltipEnabled = (pfUI and true or false) or
+        (IsAddOnLoaded and IsAddOnLoaded("pfUI"));
+    local tt;
+    if pfUITooltipEnabled and GameTooltip then
+        tt = GameTooltip;
+    else
+        tt = CreateFrame("GameTooltip","BP_MenuTT",UIParent,"GameTooltipTemplate");
+        tt:SetOwner(UIParent,"ANCHOR_NONE");
+    end
+
+    local function PrepareTooltip(anchor)
+        tt:ClearLines();
+        if pfUITooltipEnabled and tt == GameTooltip and GameTooltip_SetDefaultAnchor then
+            GameTooltip_SetDefaultAnchor(tt, anchor);
+        else
+            tt:SetOwner(anchor, "ANCHOR_RIGHT");
+        end
+    end
+
     local function ShowSpellTip(anchor, spellName)
-        tt:ClearLines(); tt:SetOwner(anchor,"ANCHOR_RIGHT");
+        PrepareTooltip(anchor);
         local idx = spellNameToIndex[spellName];
         if idx then
             tt:SetSpell(idx, BOOKTYPE_SPELL);
@@ -1826,6 +1904,78 @@ do
 
     barBg:SetAlpha(0);
     fadeControls[table.getn(fadeControls)+1] = barBg;
+
+    -- Top-right resize control. Drag horizontally to scale the complete bar;
+    -- all child icons, timers, flyouts, and controls scale with their parent.
+    local resizeGrip = CreateFrame("Button", "ST_TotemBarResizeGrip", bar);
+    resizeGrip:SetFrameStrata("HIGH");
+    resizeGrip:SetWidth(30); resizeGrip:SetHeight(TOGGLE_BTN_SIZE);
+    resizeGrip:SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT", 0, 2);
+    resizeGrip:RegisterForDrag("LeftButton");
+    local resizeBg = resizeGrip:CreateTexture(nil, "BACKGROUND");
+    resizeBg:SetAllPoints(resizeGrip); resizeBg:SetTexture(0.12,0.12,0.12,0.75);
+    local resizeLabel = resizeGrip:CreateFontString(nil, "OVERLAY");
+    resizeLabel:SetFont("Fonts\\FRIZQT__.TTF", 8, "OUTLINE");
+    resizeLabel:SetAllPoints(resizeGrip);
+    resizeLabel:SetJustifyH("CENTER"); resizeLabel:SetJustifyV("MIDDLE");
+    resizeLabel:SetTextColor(0.75,0.75,0.75,1); resizeLabel:SetText("100%");
+
+    local resizing = false;
+    local resizeStartX = 0;
+    local resizeStartScale = 1;
+    local function ClampBarScale(value)
+        if value < 0.5 then return 0.5 end
+        if value > 2.0 then return 2.0 end
+        return value;
+    end
+    local function ApplyBarScale(value, save)
+        value = ClampBarScale(tonumber(value) or 1);
+        bar:SetScale(value);
+        resizeLabel:SetText(math.floor(value * 100 + 0.5).."%");
+        settings.BAR_SCALE = value;
+        if save then SuperTotemDB.BAR_SCALE = value end
+    end
+
+    function ST_TotemBar_RefreshScale()
+        ApplyBarScale(settings.BAR_SCALE, false);
+    end
+
+    resizeGrip:SetScript("OnDragStart", function()
+        resizing = true;
+        local cursorX = GetCursorPosition();
+        local uiScale = UIParent:GetEffectiveScale();
+        resizeStartX = cursorX / uiScale;
+        resizeStartScale = bar:GetScale();
+        resizeBg:SetTexture(0.15,0.65,0.15,0.85);
+    end);
+    resizeGrip:SetScript("OnUpdate", function()
+        if not resizing then return end
+        local cursorX = GetCursorPosition();
+        local uiScale = UIParent:GetEffectiveScale();
+        local delta = (cursorX / uiScale) - resizeStartX;
+        ApplyBarScale(resizeStartScale + delta / barW, false);
+    end);
+    resizeGrip:SetScript("OnDragStop", function()
+        if not resizing then return end
+        resizing = false;
+        local rounded = math.floor(bar:GetScale() * 100 + 0.5) / 100;
+        ApplyBarScale(rounded, true);
+        resizeBg:SetTexture(0.12,0.12,0.12,0.75);
+    end);
+    resizeGrip:SetScript("OnEnter", function()
+        barHovered = true;
+        PrepareTooltip(resizeGrip);
+        tt:AddLine("Bar size: "..math.floor(bar:GetScale() * 100 + 0.5).."%",1,1,1);
+        tt:AddLine("Drag horizontally to resize",0.8,0.8,0.8);
+        tt:Show();
+    end);
+    resizeGrip:SetScript("OnLeave", function()
+        if not resizing then barHovered = false end
+        tt:Hide();
+    end);
+    resizeGrip:SetAlpha(0);
+    fadeControls[table.getn(fadeControls)+1] = resizeGrip;
+    ApplyBarScale(settings.BAR_SCALE, false);
 
     local function ResizeBar() end -- bar height is fixed; active buttons extend below without layout changes
 
@@ -2080,7 +2230,7 @@ do
                         for i=1,table.getn(flyBtns) do
                             flyBtns[i]:SetChecked(flyBtns[i].totemName==thisTotem and 1 or nil)
                         end
-                        tt:ClearLines(); tt:SetOwner(fb,"ANCHOR_RIGHT");
+                        PrepareTooltip(fb);
                         tt:AddLine("Fallback set: "..thisTotem,0.4,1,0.4); tt:Show();
                     end
                 else
@@ -2098,7 +2248,7 @@ do
                 CancelClose(elementKey);
                 local primary = GetCurrentTotem(dbKey);
                 if primary and COOLDOWN_TOTEM_CD[primary] and not COOLDOWN_TOTEM_CD[thisTotem] then
-                    tt:ClearLines(); tt:SetOwner(fb,"ANCHOR_RIGHT");
+                    PrepareTooltip(fb);
                     tt:AddLine(thisTotem,1,1,1);
                     tt:AddLine("Left-click: set primary",0.8,0.8,0.8);
                     tt:AddLine("Right-click: set as fallback",0.6,1,0.6);
@@ -2143,7 +2293,7 @@ do
                     SetFallbackTotem(elementKey, nil);
                     for i=1,table.getn(flyBtns) do flyBtns[i]:SetChecked(nil) end
                     noneBtn:SetChecked(1);
-                    tt:ClearLines(); tt:SetOwner(noneBtn,"ANCHOR_RIGHT");
+                    PrepareTooltip(noneBtn);
                     tt:AddLine("Fallback disabled for "..elementKey,0.4,1,0.4); tt:Show();
                 end
             else
@@ -2158,7 +2308,7 @@ do
         end);
         noneBtn:SetScript("OnEnter", function()
             CancelClose(elementKey);
-            tt:ClearLines(); tt:SetOwner(noneBtn, "ANCHOR_RIGHT");
+            PrepareTooltip(noneBtn);
             tt:AddLine("None", 1, 1, 1);
             local primary = GetCurrentTotem(dbKey);
             if primary and COOLDOWN_TOTEM_CD[primary] then
@@ -2379,7 +2529,7 @@ do
             RefreshToggleColors();
             if tt:IsShown() then tt:ClearLines(); tt:AddLine(type(def.tip)=="function" and def.tip() or def.tip,1,1,1); tt:Show() end
         end);
-        btn:SetScript("OnEnter",function() barHovered = true; tt:ClearLines(); tt:SetOwner(btn,"ANCHOR_RIGHT"); tt:AddLine(type(def.tip)=="function" and def.tip() or def.tip,1,1,1); tt:Show() end);
+        btn:SetScript("OnEnter",function() barHovered = true; PrepareTooltip(btn); tt:AddLine(type(def.tip)=="function" and def.tip() or def.tip,1,1,1); tt:Show() end);
         btn:SetScript("OnLeave",function() barHovered = false; tt:Hide() end);
         btn:SetAlpha(0);
         fadeControls[table.getn(fadeControls)+1] = btn;
@@ -2431,7 +2581,7 @@ do
         end);
         fb:SetScript("OnEnter", function()
             barHovered = true;
-            tt:ClearLines(); tt:SetOwner(fb,"ANCHOR_RIGHT"); tt:AddLine(opt.tip,1,1,1); tt:Show();
+            PrepareTooltip(fb); tt:AddLine(opt.tip,1,1,1); tt:Show();
         end);
         fb:SetScript("OnLeave", function() barHovered = false; tt:Hide() end);
         -- Don't add to fadeControls -- flyout should stay fully opaque when visible
@@ -2528,7 +2678,7 @@ do
             end);
             fb:SetScript("OnEnter", function()
                 barHovered = true;
-                tt:ClearLines(); tt:SetOwner(fb,"ANCHOR_RIGHT");
+                PrepareTooltip(fb);
                 local idx = weaponImbueNameToIndex[name];
                 if idx then tt:SetSpell(idx, BOOKTYPE_SPELL);
                 else tt:AddLine(name, 1,1,1) end
@@ -2656,7 +2806,7 @@ do
             end);
             fb:SetScript("OnEnter", function()
                 barHovered = true;
-                tt:ClearLines(); tt:SetOwner(fb,"ANCHOR_RIGHT");
+                PrepareTooltip(fb);
                 local idx = weaponImbueNameToIndex[name];
                 if idx then tt:SetSpell(idx, BOOKTYPE_SPELL);
                 else tt:AddLine(name,1,1,1) end
@@ -2727,7 +2877,7 @@ do
         barHovered = true;
         CancelImbueIconClose();
         OpenImbueIconFlyout();
-        tt:ClearLines(); tt:SetOwner(imbueBtn,"ANCHOR_RIGHT");
+        PrepareTooltip(imbueBtn);
         local serverName = GetMainHandEnchantName and GetMainHandEnchantName();
         local canonical = serverName and serverImbueNameToCanonical[serverName];
         local displaySpell = canonical or settings.IMBUE_TYPE;
@@ -2856,7 +3006,7 @@ do
     end
     rangeSlider:SetScript("OnEnter",function()
         barHovered = true;
-        tt:ClearLines(); tt:SetOwner(rangeSlider,"ANCHOR_RIGHT");
+        PrepareTooltip(rangeSlider);
         tt:AddLine("Global totem range threshold",1,1,1);
         tt:AddLine("Totems beyond this distance will be re-dropped.",0.8,0.8,0.8); tt:Show();
     end);
@@ -2919,7 +3069,7 @@ do
     end);
     fireRangeSlider:SetScript("OnEnter",function()
         barHovered = true;
-        tt:ClearLines(); tt:SetOwner(fireRangeSlider,"ANCHOR_RIGHT");
+        PrepareTooltip(fireRangeSlider);
         tt:AddLine("Range override: "..(settings.FIRE_TOTEM or "fire totem"),1,1,1);
         tt:AddLine("Totem will be re-dropped beyond this distance.",0.8,0.8,0.8); tt:Show();
     end);

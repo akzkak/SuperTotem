@@ -6,6 +6,19 @@ A totem and shield manager for Shaman on vanilla WoW 1.12 (interface 11200). Des
 
 ## Changelog
 
+### v1.0.4.8
+- **Quiet macro status** — Removed the routine `Totems: OUT OF RANGE - redropping` and `Totems: ACTIVE` chat announcements. Range detection and redropping are unchanged, and the details remain available when debug mode is enabled.
+
+### v1.0.4.7
+- **Draggable bar scaling** — A matching percentage control appears above the top-right corner on mouseover. Drag it horizontally to scale the entire visible totem bar from 50% to 200%; the selected size is saved per character.
+
+### v1.0.4.6
+- **pfUI tooltip integration** — Detects pfUI when loaded and uses its shared, styled `GameTooltip` plus pfUI's configured default anchoring for totem, imbue, toggle, and range tooltips. Without pfUI, SuperTotem keeps using its private tooltip frame.
+
+### v1.0.4.5
+- **Nampower multi-cast** — Detects the Nampower client mod at load. With Nampower, `/stbuff` submits every totem that the existing state, timer, range, cooldown, fallback, disabled-slot, and cleansing checks consider eligible; without it, the original one-totem-per-click behavior is unchanged.
+- **Cooldown snapshot** — Nampower multi-cast snapshots spell readiness before the first cast so its global cooldown cannot incorrectly suppress later eligible totems in the same `/stbuff` click.
+
 ### v1.0.4.4
 - **Weapon imbue tracking** — A 5th icon appears on the totem bar showing your current mainhand weapon imbue. The icon accurately reflects whatever imbue is applied to your weapon at all times, including pre-enchanted weapons you equip mid-session. Hover to open a flyout for manual selection; left-click to recast the configured imbue.
 - **Auto weapon imbue** — New `W` toggle in the settings row. When enabled, the addon automatically reapplies your configured imbue when it expires (same pattern as auto shield). The configured imbue is selected via a flyout on the `W` toggle.
@@ -23,6 +36,8 @@ A totem and shield manager for Shaman on vanilla WoW 1.12 (interface 11200). Des
 
 - Vanilla WoW 1.12 client
 - **SuperWoW** (strongly recommended) — enables GUID-based totem confirmation, position tracking, range checking, and instant destruction detection. Without it the addon falls back to buff polling, which cannot detect totems that don't apply a buff (e.g. Grounding, Fire Nova, Earthbind).
+- **Nampower** (optional) — automatically detected through `GetNampowerVersion()`. With it, one `/stbuff` click queues all currently eligible missing totems. Existing active-totem, timer, range, cooldown, fallback, disabled-slot, and cleansing-mode decisions are still respected, so `/stbuff` does not blindly replace all four totems.
+- **pfUI** (optional) — when enabled, SuperTotem uses pfUI's styled and positioned `GameTooltip`; otherwise it uses its original standalone tooltip.
 
 ---
 
@@ -134,7 +149,7 @@ All fallback settings are saved between sessions.
 |---|---|
 | `/st` or `/supertotem` | Print usage help |
 | `/stmenu` | Toggle the totem bar |
-| `/stbuff` | Drop all configured totems (main macro to bind) |
+| `/stbuff` | Drop eligible configured totems (one per click normally; all eligible missing totems per click with Nampower) |
 | `/stfirebuff` | Drop only the fire totem |
 | `/streport` | Report current totem status to party chat |
 
